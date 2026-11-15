@@ -1,4 +1,13 @@
 import { Hono } from "hono";
+import {
+  deleteCookie,
+  ensureAuthSchema,
+  getAuthIdentity,
+  hashPassword,
+  SESSION_COOKIE_NAME,
+  setCookie,
+  signSessionToken,
+} from "./access.ts";
 import { requireSameOrigin } from "./csrf.ts";
 import { composeApi } from "./compose.ts";
 import {
@@ -36,6 +45,106 @@ import type {
 export const api = new Hono<{ Bindings: Env }>();
 api.use("*", requireSameOrigin);
 api.route("/compose", composeApi);
+
+api.post("/auth/login", async (c) => {
+  await ensureAuthSchema(c.env.DB);
+  const body = await c.req.json<{ email?: string; password?: string }>().catch(() => ({}));
+  const rawEmail = (body.email ?? "").trim().toLowerCase();
+  const password = (body.password ?? "").trim();
+  if (!rawEmail || !password) {
+    return c.json({ error: "Podaj adres e-mail i hasło" }, 400);
+  }
+  const email = rawEmail.includes("@") ? rawEmail : `${rawEmail}@antekch.uk`;
+  const hash = await hashPassword(password);
+
+  const row = await c.env.DB.prepare(
+    "SELECT address, password_hash FROM mailbox_passwords WHERE address = ?",
+  )
+    .bind(email)
+    .first<{ address: string; password_hash: string }>();
+
+  const isAdmin =
+    email === "admin@antekch.uk" || email === "antek@antekch.uk";
+
+  if (!row || row.password_hash !== hash) {
+    return c.json({ error: "Nieprawidłowy adres e-mail lub hasło" }, 401);
+  }
+
+  let mailboxId: number | null = null;
+  if (!isAdmin) {
+    const mb = await c.env.DB.prepare("SELECT id FROM mailboxes WHERE address = ?")
+      .bind(email)
+      .first<{ id: number }>();
+    mailboxId = mb?.id ?? null;
+  }
+
+  const identity = {
+    email,
+    sub: email,
+    role: isAdmin ? ("admin" as const) : ("user" as const),
+    mailboxId,
+  };
+  const token = await signSessionToken(identity, c.env);
+  const isSecure = new URL(c.req.url).protocol === "https:";
+  setCookie(c, SESSION_COOKIE_NAME, token, {
+    httpOnly: true,
+    secure: isSecure,
+    sameSite: "Lax",
+    path: "/",
+    maxAge: 30 * 24 * 60 * 60,
+  });
+  return c.json({ ok: true, identity });
+});
+
+api.post("/auth/logout", async (c) => {
+  deleteCookie(c, SESSION_COOKIE_NAME, { path: "/" });
+  return c.json({ ok: true });
+});
+
+api.get("/auth/me", async (c) => {
+  const identity = getAuthIdentity(c);
+  return c.json({ ok: true, identity });
+});
+
+api.post("/auth/password", async (c) => {
+  await ensureAuthSchema(c.env.DB);
+  const identity = getAuthIdentity(c);
+  const body = await c.req.json<{ address?: string; password?: string }>().catch(() => ({}));
+  const targetAddress = (body.address ?? identity?.email ?? "").trim().toLowerCase();
+  const newPassword = (body.password ?? "").trim();
+  if (!targetAddress || newPassword.length < 4) {
+    return c.json({ error: "Hasło musi mieć co najmniej 4 znaki" }, 400);
+  }
+  if (identity?.role !== "admin" && identity?.email.toLowerCase() !== targetAddress) {
+    return c.json({ error: "Brak uprawnień do zmiany tego hasła" }, 403);
+  }
+  const hash = await hashPassword(newPassword);
+  await c.env.DB.prepare(
+    `INSERT INTO mailbox_passwords (address, password_hash, plain_password, updated_at)
+     VALUES (?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+     ON CONFLICT(address) DO UPDATE SET
+       password_hash = excluded.password_hash,
+       plain_password = excluded.plain_password,
+       updated_at = excluded.updated_at`,
+  )
+    .bind(targetAddress, hash, newPassword)
+    .run();
+  return c.json({ ok: true });
+});
+
+api.get("/auth/passwords", async (c) => {
+  await ensureAuthSchema(c.env.DB);
+  const identity = getAuthIdentity(c);
+  if (identity?.role !== "admin") {
+    return c.json({ passwords: {} });
+  }
+  const { results } = await c.env.DB.prepare(
+    "SELECT address, plain_password FROM mailbox_passwords",
+  ).all<{ address: string; plain_password: string }>();
+  const passwords: Record<string, string> = {};
+  for (const r of results) passwords[r.address.toLowerCase()] = r.plain_password;
+  return c.json({ passwords });
+});
 
 api.get("/settings/general", async (c) => {
   const [settings, subscriptions] = await Promise.all([
@@ -126,6 +235,9 @@ api.delete("/settings/browser-notifications", async (c) => {
 });
 
 api.get("/mailboxes", async (c) => {
+  await ensureAuthSchema(c.env.DB);
+  const identity = getAuthIdentity(c);
+  const filterEmail = identity && identity.role !== "admin" ? identity.email.toLowerCase() : null;
   const { results } = await c.env.DB.prepare(
     `SELECT m.*,
        (SELECT COUNT(*) FROM threads t
@@ -134,7 +246,10 @@ api.get("/mailboxes", async (c) => {
         WHERE t.mailbox_id = m.id AND msg.direction = 'inbound') AS has_received
      FROM mailboxes m ORDER BY m.address`,
   ).all<Omit<Mailbox, "has_received"> & { has_received: number }>();
-  return c.json(results.map((row) => ({ ...row, has_received: row.has_received === 1 })));
+  const filtered = filterEmail
+    ? results.filter((row) => row.address.toLowerCase() === filterEmail)
+    : results;
+  return c.json(filtered.map((row) => ({ ...row, has_received: row.has_received === 1 })));
 });
 
 api.get("/domains", async (c) => {
@@ -209,6 +324,7 @@ api.post("/mailboxes", async (c) => {
   }
 
   const address = `${localPart}@${domain.name}`;
+  await ensureAuthSchema(c.env.DB);
 
   const existing = await c.env.DB.prepare("SELECT id FROM mailboxes WHERE address = ?")
     .bind(address)
@@ -223,6 +339,14 @@ api.post("/mailboxes", async (c) => {
     )
       .bind(address, domain.id)
       .first<Mailbox>();
+    const defaultPass = `${localPart.charAt(0).toUpperCase()}${localPart.slice(1)}2026!`;
+    const passHash = await hashPassword(defaultPass);
+    await c.env.DB.prepare(
+      `INSERT OR IGNORE INTO mailbox_passwords (address, password_hash, plain_password)
+       VALUES (?, ?, ?)`,
+    )
+      .bind(address, passHash, defaultPass)
+      .run();
   } catch (error) {
     if (error instanceof Error && error.message.includes("UNIQUE")) {
       return c.json({ error: "This inbox already exists" }, 409);
@@ -469,7 +593,18 @@ api.delete("/labels/:id", async (c) => {
 });
 
 api.get("/threads", async (c) => {
-  const mailboxId = c.req.query("mailbox_id");
+  const identity = getAuthIdentity(c);
+  let mailboxId = c.req.query("mailbox_id");
+  if (identity && identity.role !== "admin") {
+    if (identity.mailboxId !== null && identity.mailboxId > 0) {
+      mailboxId = String(identity.mailboxId);
+    } else {
+      const mb = await c.env.DB.prepare("SELECT id FROM mailboxes WHERE LOWER(address) = ?")
+        .bind(identity.email.toLowerCase())
+        .first<{ id: number }>();
+      mailboxId = String(mb?.id ?? -1);
+    }
+  }
   const labelId = c.req.query("label_id");
   const status = c.req.query("status") ?? "open";
   if (!["open", "archived", "needs_human"].includes(status)) {
@@ -569,6 +704,15 @@ api.get("/threads/:id", async (c) => {
     .bind(id)
     .first();
   if (!thread) return c.json({ error: "thread not found" }, 404);
+  const identity = getAuthIdentity(c);
+  if (
+    identity &&
+    identity.role !== "admin" &&
+    String((thread as { mailbox_address?: string }).mailbox_address ?? "").toLowerCase() !==
+      identity.email.toLowerCase()
+  ) {
+    return c.json({ error: "thread not found" }, 404);
+  }
   await attachLabels(c.env, [thread as { id: number; labels: ThreadLabel[] }]);
 
   const [messages, drafts, draftRun] = await Promise.all([
@@ -853,7 +997,18 @@ api.post("/drafts/:id/discard", async (c) => {
 
 api.get("/search", async (c) => {
   const q = c.req.query("q")?.trim();
-  const mailboxId = c.req.query("mailbox_id");
+  const identity = getAuthIdentity(c);
+  let mailboxId = c.req.query("mailbox_id");
+  if (identity && identity.role !== "admin") {
+    if (identity.mailboxId !== null && identity.mailboxId > 0) {
+      mailboxId = String(identity.mailboxId);
+    } else {
+      const mb = await c.env.DB.prepare("SELECT id FROM mailboxes WHERE LOWER(address) = ?")
+        .bind(identity.email.toLowerCase())
+        .first<{ id: number }>();
+      mailboxId = String(mb?.id ?? -1);
+    }
+  }
   const labelId = c.req.query("label_id");
   if (!q) return c.json([]);
   const { results } = await c.env.DB.prepare(
