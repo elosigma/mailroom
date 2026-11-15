@@ -149,9 +149,104 @@ export function GeneralSettings(props: {
 
         <AiModelSettings saved={settings.data?.ai_model} />
 
+        <PasswordSettings />
+
         <McpSettings />
       </SettingsPage>
     </div>
+  );
+}
+
+function PasswordSettings() {
+  const [address, setAddress] = useState("");
+  const [password, setPassword] = useState("");
+  const [status, setStatus] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+
+  const passwordsQuery = useQuery({
+    queryKey: ["auth-passwords"],
+    queryFn: async () => {
+      const res = await fetch("/api/auth/passwords");
+      if (!res.ok) return { passwords: {} as Record<string, string> };
+      return res.json() as Promise<{ passwords: Record<string, string> }>;
+    },
+  });
+
+  const handleSave = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!password.trim()) return;
+    setSaving(true);
+    setStatus(null);
+    setError(null);
+    try {
+      const res = await fetch("/api/auth/password", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          address: address.trim() || undefined,
+          password: password.trim(),
+        }),
+      });
+      const data = (await res.json().catch(() => ({}))) as { ok?: boolean; error?: string };
+      if (!res.ok || !data.ok) {
+        setError(data.error || "Nie udało się zapisać hasła");
+      } else {
+        setStatus("Hasło zostało zapisane!");
+        setPassword("");
+        void passwordsQuery.refetch();
+      }
+    } catch {
+      setError("Błąd połączenia.");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const entries = Object.entries(passwordsQuery.data?.passwords ?? {});
+
+  return (
+    <SettingsBlock id="password-settings-heading" title="Hasła do skrzynek">
+      <SettingsPanel>
+        <div className="px-4 py-4 sm:px-5 space-y-4">
+          {entries.length > 0 && (
+            <div className="space-y-1.5">
+              <p className="text-[13px] font-medium text-foreground">Aktualne hasła skrzynek:</p>
+              <div className="rounded-lg border divide-y text-[13px]">
+                {entries.map(([addr, pass]) => (
+                  <div key={addr} className="flex items-center justify-between px-3 py-2">
+                    <span className="font-medium">{addr}</span>
+                    <code className="rounded bg-muted px-2 py-0.5 font-mono text-xs">{pass}</code>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+          <form onSubmit={handleSave} className="space-y-3">
+            <p className="text-[13px] font-medium text-foreground">Ustaw lub zmień hasło</p>
+            <div className="flex flex-col gap-2 sm:flex-row max-w-xl">
+              <Input
+                value={address}
+                onChange={(e) => setAddress(e.target.value)}
+                placeholder="Adres (np. ola@antekch.uk, puste = Twoje konto)"
+                className="text-[13px]"
+              />
+              <Input
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                placeholder="Nowe hasło (min. 4 znaki)"
+                className="text-[13px]"
+              />
+              <Button type="submit" variant="outline" disabled={saving || password.trim().length < 4}>
+                {saving ? "Zapisywanie…" : "Zapisz hasło"}
+              </Button>
+            </div>
+            {status && <p className="text-xs text-emerald-600">{status}</p>}
+            {error && <p className="text-xs text-destructive">{error}</p>}
+          </form>
+        </div>
+      </SettingsPanel>
+    </SettingsBlock>
   );
 }
 
