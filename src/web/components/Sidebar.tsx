@@ -74,7 +74,7 @@ export function Sidebar(props: {
         </Button>
       </div>
 
-      <div className="shrink-0 border-t px-3 py-2">
+      <div className="shrink-0 border-t px-3 py-2 space-y-1">
         <SidebarItem
           label="Settings"
           icon={<SettingsIcon className="h-4 w-4" />}
@@ -82,6 +82,16 @@ export function Sidebar(props: {
           active={props.activeView === "settings"}
           onClick={props.onOpenSettings}
         />
+        <button
+          type="button"
+          onClick={async () => {
+            await fetch("/api/auth/logout", { method: "POST" }).catch(() => {});
+            window.location.href = "/inbox";
+          }}
+          className="flex h-8 w-full items-center gap-2.5 rounded-md px-2.5 text-left text-[13px] text-muted-foreground hover:bg-sidebar-accent/60 hover:text-foreground"
+        >
+          <span>Wyloguj się</span>
+        </button>
       </div>
     </aside>
   );
