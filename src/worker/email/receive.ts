@@ -24,6 +24,15 @@ export async function receiveEmail(
     return;
   }
 
+  // Forward copy to Gmail if recipient is antek@antekch.uk
+  if (message.to.trim().toLowerCase() === "antek@antekch.uk") {
+    try {
+      await message.forward("antekchlebek8@gmail.com");
+    } catch (error) {
+      console.error("Failed to forward copy to Gmail", error);
+    }
+  }
+
   const rawBuffer = await new Response(message.raw).arrayBuffer();
   const fingerprint = await rawFingerprint(rawBuffer);
   const parsed = await PostalMime.parse(rawBuffer);
