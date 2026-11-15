@@ -38,8 +38,12 @@ export const authorizationHandler: ExportedHandler<AuthorizationEnv> = {
       });
     }
 
-    // /authorize is covered by the same Access application as the web app.
-    const access = await verifyWebAccess(request.headers.get("Cf-Access-Jwt-Assertion"), env);
+    // /authorize is covered by the same Access application or session cookie as the web app.
+    const access = await verifyWebAccess(
+      request.headers.get("Cf-Access-Jwt-Assertion"),
+      env,
+      request.headers.get("Cookie"),
+    );
     if (!access.ok) {
       return htmlPage("Authorization unavailable", `<p>${escapeHtml(access.error)}</p>`, access.status);
     }
